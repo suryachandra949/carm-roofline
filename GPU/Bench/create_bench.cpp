@@ -736,9 +736,11 @@ void create_benchmark_mem(int device, string arch, string compute_capability, st
 	}
 }
 
+
 void create_benchmark_mixed(int device, string arch, string compute_capability, string target,
 							string operation, string precision, double arithmetic_intensity,
-							uint64_t working_set_mb, int threads_per_block, int num_blocks) {
+							uint64_t working_set_mb, int threads_per_block, int num_blocks,
+							int measured_iterations, int warmup_iterations, double l2_fraction) {
 	if (arch != "nvidia") {
 		cerr << "ERROR: Mixed benchmarks are currently implemented for NVIDIA GPUs only." << endl;
 		exit(23);
@@ -763,6 +765,14 @@ void create_benchmark_mixed(int device, string arch, string compute_capability, 
 		cerr << "ERROR: Global mixed benchmark working set must be greater than zero." << endl;
 		exit(28);
 	}
+	if (measured_iterations <= 0 || warmup_iterations < 0) {
+		cerr << "ERROR: Measured iterations must be positive and warmups cannot be negative." << endl;
+		exit(29);
+	}
+	if (!(l2_fraction > 0.0 && l2_fraction <= 1.0) || !isfinite(l2_fraction)) {
+		cerr << "ERROR: L2 fraction must be finite, greater than zero, and at most one." << endl;
+		exit(30);
+	}
 
 	string cuda_type;
 	int element_bytes = 0;
@@ -785,11 +795,11 @@ void create_benchmark_mixed(int device, string arch, string compute_capability, 
 		element_bytes = 2;
 	} else {
 		cerr << "ERROR: Mixed benchmark supports sp, dp, hp, hp2, and bf16." << endl;
-		exit(29);
+		exit(31);
 	}
 	if (target == "shared" && precision != "sp" && precision != "dp") {
 		cerr << "ERROR: Shared mixed benchmark currently supports sp and dp." << endl;
-		exit(30);
+		exit(32);
 	}
 
 	const int scalar_flops = operation == "fma" ? 2 : 1;
@@ -800,33 +810,31 @@ void create_benchmark_mixed(int device, string arch, string compute_capability, 
 	if (operation_count > 65536) {
 		cerr << "ERROR: Requested arithmetic intensity requires more than 65536 operations per element."
 			 << endl;
-		exit(31);
+		exit(33);
 	}
 	const double effective_ai = static_cast<double>(operation_count * flops_per_element_op) /
 		(2.0 * element_bytes);
 	if (working_set_mb > numeric_limits<uint64_t>::max() / (1024ULL * 1024ULL)) {
 		cerr << "ERROR: Working set is too large." << endl;
-		exit(32);
+		exit(34);
 	}
 	const uint64_t working_set_bytes = working_set_mb * 1024ULL * 1024ULL;
 
 	if (!filesystem::is_directory("GPU/bin") && !filesystem::create_directory("GPU/bin")) {
 		cerr << "ERROR: Wasn't able to create bin directory" << endl;
-		exit(33);
+		exit(35);
 	}
 	ifstream input("GPU/Test/nvidia/mixed/vector.cu");
 	ofstream output("GPU/bin/test.cu");
 	if (!input.is_open() || !output.is_open()) {
 		cerr << "ERROR: Could not open mixed benchmark template or generated output." << endl;
-		exit(34);
+		exit(36);
 	}
 
 	string text;
 	while (getline(input, text)) {
 		output << text << endl;
-		if (text == "// DEFINE NUM_REPS") {
-			output << "#define NUM_REPS " << Num_Reps << endl;
-		} else if (text == "// DEFINE KERNEL PARAMETERS") {
+		if (text == "// DEFINE KERNEL PARAMETERS") {
 			output << "#define THREADS_PER_BLOCK " << threads_per_block << endl;
 			output << "#define NUM_BLOCKS " << num_blocks << endl;
 		} else if (text == "// DEFINE PRECISION") {
@@ -840,6 +848,10 @@ void create_benchmark_mixed(int device, string arch, string compute_capability, 
 			output << "#define FLOPS_PER_ELEMENT_OP " << flops_per_element_op << endl;
 			output << setprecision(17) << "#define EFFECTIVE_AI " << effective_ai << endl;
 			output << "#define REQUESTED_WORKING_SET_BYTES " << working_set_bytes << "ULL" << endl;
+		} else if (text == "// DEFINE BENCHMARK CONTROL") {
+			output << "#define MEASURED_ITERATIONS " << measured_iterations << endl;
+			output << "#define WARMUP_ITERATIONS " << warmup_iterations << endl;
+			output << setprecision(17) << "#define L2_FRACTION " << l2_fraction << endl;
 		} else if (text == "\t// DEFINE OPERATION") {
 			if (precision == "sp") {
 				if (operation == "fma")
@@ -882,10 +894,12 @@ void create_benchmark_mixed(int device, string arch, string compute_capability, 
 	input.close();
 	output.close();
 
+	string nvcc_flags = "-arch=sm_" + compute_capability;
+	if (target == "L2") nvcc_flags += " -Xptxas -dlcm=cg";
 	const string command = "make compute_capability=" + compute_capability +
-		" -f GPU/Test/nvidia/Makefile";
+		" NVCCFLAGS=\"" + nvcc_flags + "\" -f GPU/Test/nvidia/Makefile";
 	if (system(command.data()) != 0) {
 		cerr << "ERROR: It was not possible to generate the mixed benchmark." << endl;
-		exit(35);
+		exit(37);
 	}
 }

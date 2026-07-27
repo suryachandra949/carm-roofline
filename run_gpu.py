@@ -75,22 +75,55 @@ def update_csv(name, test, results, date, target, precision, inst, threads, bloc
 			writer.writerow(output)
 
 
+
 def update_mixed_csv(name, results, date, target, precision, operation, threads, blocks,
-                     requested_ai, working_set_mb, out_path):
+                     requested_ai, requested_working_set_mb, iterations,
+                     warmup_iterations, l2_fraction, out_path):
 	mixed_dir = os.path.join(out_path, "Mixed")
 	os.makedirs(mixed_dir, exist_ok=True)
 	csv_path = os.path.join(mixed_dir, f"{name}_Mixed.csv")
-	header = ["Date", "ISA", "Precision", "Memory Target", "FP Inst.",
-			  "Threads per Block", "Number of Blocks", "Requested AI (FLOP/byte)",
-			  "Effective AI (FLOP/byte)", "Working Set (MiB)", "GFLOP/s", "GB/s"]
-	row = [date, "cuda", precision, target, operation, threads, blocks, requested_ai,
-		   results["ai"], results["working_set_mib"], results["gflops"], results["bandwidth"]]
+	header = [
+		"Date", "ISA", "Precision", "Memory Target", "FP Inst.",
+		"Threads per Block", "Number of Blocks", "Requested AI (FLOP/byte)",
+		"Effective AI (FLOP/byte)", "Working Set (MiB)",
+		"Average Time (ms/iteration)", "Time Stddev (ms)",
+		"Minimum Time (ms)", "Maximum Time (ms)",
+		"Measured Iterations", "Warmup Iterations", "Requested L2 Fraction",
+		"GFLOP/s", "GB/s"
+	]
+	row = [
+		date, "cuda", precision, target, operation, threads, blocks, requested_ai,
+		results["ai"], results["working_set_mib"], results["average_ms"],
+		results["stddev_ms"], results["minimum_ms"], results["maximum_ms"],
+		iterations, warmup_iterations, l2_fraction,
+		results["gflops"], results["bandwidth"]
+	]
 	write_header = not os.path.exists(csv_path)
 	with open(csv_path, 'a', newline='') as csvfile:
 		writer = csv.writer(csvfile)
 		if write_header:
 			writer.writerow(header)
 		writer.writerow(row)
+
+def parse_mixed_output(text):
+	fields = text.split()
+	def value_before(label):
+		try:
+			index = fields.index(label)
+			return float(fields[index - 1])
+		except (ValueError, IndexError):
+			raise ValueError(f"Missing {label} in mixed benchmark output: {text}")
+
+	return {
+		"gflops": value_before("GFLOP/s"),
+		"bandwidth": value_before("GB/s"),
+		"ai": value_before("FLOP/byte"),
+		"working_set_mib": value_before("MiB"),
+		"average_ms": value_before("ms/iteration"),
+		"stddev_ms": value_before("ms_stddev"),
+		"minimum_ms": value_before("ms_min"),
+		"maximum_ms": value_before("ms_max"),
+	}
 
 def check_hardware(verbose, set_freq, freq_sm, freq_mem, arch, target_vector, target_tensor):
 	compute_capability = 0
@@ -428,8 +461,10 @@ def run_roofline(verbose, name, out, set_freq, freq_sm, freq_mem, arch, target_v
 
 
 
+
 def run_mixed(verbose, name, out, set_freq, freq_sm, freq_mem, arch, target_vector,
-              vector_op, threads, blocks, memory_target, requested_ai, working_set_mb):
+              vector_op, threads, blocks, memory_target, requested_ai, working_set_mb,
+              iterations, warmup_iterations, l2_fraction):
 	if arch != "nvidia":
 		print("ERROR: The GPU mixed benchmark is currently implemented for NVIDIA GPUs only.")
 		sys.exit(25)
@@ -439,6 +474,15 @@ def run_mixed(verbose, name, out, set_freq, freq_sm, freq_mem, arch, target_vect
 	if working_set_mb <= 0 and memory_target == "global":
 		print("ERROR: --working_set_mb must be greater than zero for the global target.")
 		sys.exit(27)
+	if iterations <= 0:
+		print("ERROR: --iterations must be greater than zero.")
+		sys.exit(28)
+	if warmup_iterations < 0:
+		print("ERROR: --warmup_iterations cannot be negative.")
+		sys.exit(29)
+	if not 0.0 < l2_fraction <= 1.0:
+		print("ERROR: --l2_fraction must be greater than zero and at most one.")
+		sys.exit(30)
 
 	compute_capability, target_vector, _ = check_hardware(
 		verbose, set_freq, freq_sm, freq_mem, arch, target_vector, ['none'])
@@ -452,11 +496,11 @@ def run_mixed(verbose, name, out, set_freq, freq_sm, freq_mem, arch, target_vect
 			print(f"WARNING: Mixed {memory_target} benchmark does not support {precision}; skipping it.")
 	if not filtered:
 		print("ERROR: No supported floating-point precision remains for the mixed benchmark.")
-		sys.exit(28)
+		sys.exit(31)
 
 	if out != './Results' and not os.path.isdir(out):
 		print("ERROR: Provided output path does not exist")
-		sys.exit(29)
+		sys.exit(32)
 	os.makedirs(out, exist_ok=True)
 
 	os.system("cd GPU && make -s clean && make -s")
@@ -466,38 +510,34 @@ def run_mixed(verbose, name, out, set_freq, freq_sm, freq_mem, arch, target_vect
 			"--arch", arch, "--operation", vector_op, "--precision", precision,
 			"--compute", str(compute_capability), "--threads", str(threads),
 			"--blocks", str(blocks), "--device", str(DEVICE), "--ai", str(requested_ai),
-			"--working-set-mb", str(working_set_mb)
+			"--working-set-mb", str(working_set_mb),
+			"--iterations", str(iterations),
+			"--warmup-iterations", str(warmup_iterations),
+			"--l2-fraction", str(l2_fraction)
 		], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 		if generator.returncode != 0:
 			print(generator.stderr.decode('utf-8').rstrip())
-			sys.exit(30)
+			sys.exit(33)
 
 		benchmark = subprocess.run(["./GPU/bin/test"], stdout=subprocess.PIPE,
 							   stderr=subprocess.PIPE)
 		if benchmark.returncode != 0:
 			print(benchmark.stderr.decode('utf-8').rstrip())
-			sys.exit(31)
+			sys.exit(34)
 
 		text = benchmark.stdout.decode('utf-8').strip()
-		fields = text.split()
-		if len(fields) < 8:
-			print(f"ERROR: Unexpected mixed benchmark output: {text}")
-			sys.exit(32)
 		try:
-			results = {
-				"gflops": float(fields[0]),
-				"bandwidth": float(fields[2]),
-				"ai": float(fields[4]),
-				"working_set_mib": float(fields[6]),
-			}
-		except ValueError:
-			print(f"ERROR: Could not parse mixed benchmark output: {text}")
-			sys.exit(33)
+			results = parse_mixed_output(text)
+		except ValueError as error:
+			print(f"ERROR: {error}")
+			sys.exit(35)
 
 		print(f"Mixed({memory_target}, {precision}, {vector_op}, requested AI={requested_ai}): {text}")
 		date = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-		update_mixed_csv(name, results, date, memory_target, precision, vector_op,
-						 threads, blocks, requested_ai, working_set_mb, out)
+		update_mixed_csv(
+			name, results, date, memory_target, precision, vector_op,
+			threads, blocks, requested_ai, working_set_mb, iterations,
+			warmup_iterations, l2_fraction, out)
 
 def shutdown(set_freq):
 	if set_freq:
@@ -561,7 +601,8 @@ def main():
 	if args.test == 'mixed':
 		run_mixed(args.verbose, name, args.output, args.set_freq, args.freq_sm, args.freq_mem,
 				  arch, args.vector, args.vector_op, args.threads, args.blocks,
-				  args.mixed_target, args.ai, args.working_set_mb)
+				  args.mixed_target, args.ai, args.working_set_mb,
+				  args.iterations, args.warmup_iterations, args.l2_fraction)
 	else:
 		run_roofline(args.verbose, name, args.output, args.set_freq, args.freq_sm, args.freq_mem,
 					 arch, args.vector, args.tensor, args.vector_op, args.threads, args.blocks)

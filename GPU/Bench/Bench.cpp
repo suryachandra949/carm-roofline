@@ -27,6 +27,9 @@ int main(int argc, char* argv[]) {
 									  {"device", required_argument, 0, 'd'},
 									  {"ai", required_argument, 0, 'r'},
 									  {"working-set-mb", required_argument, 0, 'w'},
+									  {"iterations", required_argument, 0, 'n'},
+									  {"warmup-iterations", required_argument, 0, 'u'},
+									  {"l2-fraction", required_argument, 0, 'f'},
 									  {0, 0, 0, 0}};
 
 	int o;
@@ -36,8 +39,11 @@ int main(int argc, char* argv[]) {
 	int DEVICE = 0;
 	double arithmetic_intensity = 0.0;
 	uint64_t working_set_mb = 0;
+	int measured_iterations = 100;
+	int warmup_iterations = 20;
+	double l2_fraction = 0.50;
 
-	while ((o = getopt_long(argc, argv, "t:c:i:a:p:o:hs:b:d:r:w:", longopts, NULL)) != -1) switch (o) {
+	while ((o = getopt_long(argc, argv, "t:c:i:a:p:o:hs:b:d:r:w:n:u:f:", longopts, NULL)) != -1) switch (o) {
 			case 't':
 				test = optarg;
 				break;
@@ -70,6 +76,15 @@ int main(int argc, char* argv[]) {
 				break;
 			case 'w':
 				working_set_mb = strtoull(optarg, NULL, 10);
+				break;
+			case 'n':
+				measured_iterations = atoi(optarg);
+				break;
+			case 'u':
+				warmup_iterations = atoi(optarg);
+				break;
+			case 'f':
+				l2_fraction = strtod(optarg, NULL);
 				break;
 			case 'h':
 				// TODO: IMPLEMENT
@@ -115,7 +130,8 @@ int main(int argc, char* argv[]) {
 							 num_blocks);
 	} else if (test == "MIXED") {
 		create_benchmark_mixed(DEVICE, arch, compute_capability, target, operation, precision,
-						   arithmetic_intensity, working_set_mb, threads_per_block, num_blocks);
+						   arithmetic_intensity, working_set_mb, threads_per_block, num_blocks,
+						   measured_iterations, warmup_iterations, l2_fraction);
 	} else {
 		cerr << "ERROR: Test not found. Please select a valid test." << endl;
 		return 2;
