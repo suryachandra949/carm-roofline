@@ -74,6 +74,24 @@ def update_csv(name, test, results, date, target, precision, inst, threads, bloc
 			writer.writerow(primary_headers)
 			writer.writerow(output)
 
+
+def update_mixed_csv(name, results, date, target, precision, operation, threads, blocks,
+                     requested_ai, working_set_mb, out_path):
+	mixed_dir = os.path.join(out_path, "Mixed")
+	os.makedirs(mixed_dir, exist_ok=True)
+	csv_path = os.path.join(mixed_dir, f"{name}_Mixed.csv")
+	header = ["Date", "ISA", "Precision", "Memory Target", "FP Inst.",
+			  "Threads per Block", "Number of Blocks", "Requested AI (FLOP/byte)",
+			  "Effective AI (FLOP/byte)", "Working Set (MiB)", "GFLOP/s", "GB/s"]
+	row = [date, "cuda", precision, target, operation, threads, blocks, requested_ai,
+		   results["ai"], results["working_set_mib"], results["gflops"], results["bandwidth"]]
+	write_header = not os.path.exists(csv_path)
+	with open(csv_path, 'a', newline='') as csvfile:
+		writer = csv.writer(csvfile)
+		if write_header:
+			writer.writerow(header)
+		writer.writerow(row)
+
 def check_hardware(verbose, set_freq, freq_sm, freq_mem, arch, target_vector, target_tensor):
 	compute_capability = 0
 	gpu_name = ''
@@ -409,6 +427,78 @@ def run_roofline(verbose, name, out, set_freq, freq_sm, freq_mem, arch, target_v
 		print("--------------------------------------------------")
 
 
+
+def run_mixed(verbose, name, out, set_freq, freq_sm, freq_mem, arch, target_vector,
+              vector_op, threads, blocks, memory_target, requested_ai, working_set_mb):
+	if arch != "nvidia":
+		print("ERROR: The GPU mixed benchmark is currently implemented for NVIDIA GPUs only.")
+		sys.exit(25)
+	if requested_ai <= 0:
+		print("ERROR: --ai must be greater than zero.")
+		sys.exit(26)
+	if working_set_mb <= 0 and memory_target == "global":
+		print("ERROR: --working_set_mb must be greater than zero for the global target.")
+		sys.exit(27)
+
+	compute_capability, target_vector, _ = check_hardware(
+		verbose, set_freq, freq_sm, freq_mem, arch, target_vector, ['none'])
+
+	supported = {'sp', 'dp', 'hp', 'hp2', 'bf16'}
+	if memory_target == 'shared':
+		supported = {'sp', 'dp'}
+	filtered = [precision for precision in target_vector if precision in supported]
+	for precision in target_vector:
+		if precision not in supported:
+			print(f"WARNING: Mixed {memory_target} benchmark does not support {precision}; skipping it.")
+	if not filtered:
+		print("ERROR: No supported floating-point precision remains for the mixed benchmark.")
+		sys.exit(28)
+
+	if out != './Results' and not os.path.isdir(out):
+		print("ERROR: Provided output path does not exist")
+		sys.exit(29)
+	os.makedirs(out, exist_ok=True)
+
+	os.system("cd GPU && make -s clean && make -s")
+	for precision in filtered:
+		generator = subprocess.run([
+			"./GPU/Bench/Bench", "--test", "MIXED", "--target", memory_target,
+			"--arch", arch, "--operation", vector_op, "--precision", precision,
+			"--compute", str(compute_capability), "--threads", str(threads),
+			"--blocks", str(blocks), "--device", str(DEVICE), "--ai", str(requested_ai),
+			"--working-set-mb", str(working_set_mb)
+		], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+		if generator.returncode != 0:
+			print(generator.stderr.decode('utf-8').rstrip())
+			sys.exit(30)
+
+		benchmark = subprocess.run(["./GPU/bin/test"], stdout=subprocess.PIPE,
+							   stderr=subprocess.PIPE)
+		if benchmark.returncode != 0:
+			print(benchmark.stderr.decode('utf-8').rstrip())
+			sys.exit(31)
+
+		text = benchmark.stdout.decode('utf-8').strip()
+		fields = text.split()
+		if len(fields) < 8:
+			print(f"ERROR: Unexpected mixed benchmark output: {text}")
+			sys.exit(32)
+		try:
+			results = {
+				"gflops": float(fields[0]),
+				"bandwidth": float(fields[2]),
+				"ai": float(fields[4]),
+				"working_set_mib": float(fields[6]),
+			}
+		except ValueError:
+			print(f"ERROR: Could not parse mixed benchmark output: {text}")
+			sys.exit(33)
+
+		print(f"Mixed({memory_target}, {precision}, {vector_op}, requested AI={requested_ai}): {text}")
+		date = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+		update_mixed_csv(name, results, date, memory_target, precision, vector_op,
+						 threads, blocks, requested_ai, working_set_mb, out)
+
 def shutdown(set_freq):
 	if set_freq:
 		result = subprocess.run(['nvidia-smi', '-i', str(DEVICE), '-pm', '0'], stdout=subprocess.PIPE)
@@ -419,7 +509,7 @@ def shutdown(set_freq):
 def main():
 	# Parse arguments
 	parser = argparse.ArgumentParser(description='Script to run GPU micro-benchmarks to construct the Cache-Aware Roofline Model for GPUs')
-	parser.add_argument('--test', default='roofline', nargs= '?', choices=['FP', 'TC', 'roofline', 'MEM'], help='Type of test.Type of the test. Roofline test measures the bandwidth of the different memory levels and FP Performance, MEM test measures the bandwidth of various memory sizes, mixed test measures bandwidth and FP performance for a combination of memory acceses (to L1, L2, L3, or DRAM) and FP operations (Default: roofline) ')
+	parser.add_argument('--test', default='roofline', nargs= '?', choices=['FP', 'TC', 'roofline', 'MEM', 'mixed'], help='Type of test.Type of the test. Roofline test measures the bandwidth of the different memory levels and FP Performance, MEM test measures the bandwidth of various memory sizes, mixed test measures bandwidth and FP performance for a combination of memory acceses (to L1, L2, L3, or DRAM) and FP operations (Default: roofline) ')
 	parser.add_argument('--name', default='unnamed', nargs= '?', help='Name of the GPU to be tested (if not using config file)')
 	parser.add_argument('config', nargs='?', help='Path to the configuration file')
 	parser.add_argument('-v', '--verbose', default=1, nargs='?', type=int, choices=[0, 1, 2, 3], help='Level of terminal output (0 -> No Output 1 -> Only Errors and Test Details, 2 -> Intermediate Test Results, 3 -> Configuration Values Selected/Detected)')
@@ -432,6 +522,9 @@ def main():
 	parser.add_argument('--vector', default=['auto'], nargs='+', choices=['none','auto','hp', 'hp2', 'int', 'sp', 'dp', 'bf16'], help='Set of CUDA core arithmetic precisions to test. If auto, all will be tested.')
 	parser.add_argument('--tensor', default=['auto'], nargs='+', choices=['none','auto', 'fp16_32', 'fp16_16', 'tf32', 'bf16', 'fp8', 'int8', 'int4', 'int1', 'fp64','fp32'], help='Set of Tensor Core arithmetic precisions to test. If auto, all will be tested.')
 	parser.add_argument('--vector_op', dest='vector_op', default='add', nargs='?', choices=['fma', 'add', 'mul'], help="Desired operation to execute in CUDA Cores.")
+	parser.add_argument('--mixed_target', default='global', nargs='?', choices=['shared', 'L2', 'global'], help='Memory level used by the mixed benchmark (Default: global)')
+	parser.add_argument('--ai', default=32.0, nargs='?', type=float, help='Requested mixed-benchmark arithmetic intensity in FLOPs/byte (Default: 32)')
+	parser.add_argument('--working_set_mb', default=512, nargs='?', type=int, help='Total two-buffer global-memory working set in MiB (Default: 512)')
 
 	parser.add_argument('--threads', default=1024, nargs='?', type=int, help='Num of threads per block to execute in the benchmarks')
 	parser.add_argument('--blocks', default=32768, nargs='?', type=int, help='Number of thread blocks to execute in the benchmarks')
@@ -465,7 +558,13 @@ def main():
 			print('AMD GPU not detected. This tool requires the amd-smi CLI.')
 			sys.exit(1)
 
-	run_roofline(args.verbose, args.name, args.output, args.set_freq, args.freq_sm, args.freq_mem, arch, args.vector, args.tensor, args.vector_op, args.threads, args.blocks)
+	if args.test == 'mixed':
+		run_mixed(args.verbose, name, args.output, args.set_freq, args.freq_sm, args.freq_mem,
+				  arch, args.vector, args.vector_op, args.threads, args.blocks,
+				  args.mixed_target, args.ai, args.working_set_mb)
+	else:
+		run_roofline(args.verbose, name, args.output, args.set_freq, args.freq_sm, args.freq_mem,
+					 arch, args.vector, args.tensor, args.vector_op, args.threads, args.blocks)
 
 	shutdown(args.set_freq)
 

@@ -1,4 +1,8 @@
 #include <cstdio>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <limits>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -729,5 +733,159 @@ void create_benchmark_mem(int device, string arch, string compute_capability, st
 			cerr << "ERROR: It was not possible to generate the benchmark." << endl;
 			exit(22);
 		}
+	}
+}
+
+void create_benchmark_mixed(int device, string arch, string compute_capability, string target,
+							string operation, string precision, double arithmetic_intensity,
+							uint64_t working_set_mb, int threads_per_block, int num_blocks) {
+	if (arch != "nvidia") {
+		cerr << "ERROR: Mixed benchmarks are currently implemented for NVIDIA GPUs only." << endl;
+		exit(23);
+	}
+	if (target != "global" && target != "L2" && target != "shared") {
+		cerr << "ERROR: Mixed target must be shared, L2, or global." << endl;
+		exit(24);
+	}
+	if (operation != "fma" && operation != "add" && operation != "mul") {
+		cerr << "ERROR: Mixed operation must be fma, add, or mul." << endl;
+		exit(25);
+	}
+	if (arithmetic_intensity <= 0.0 || !isfinite(arithmetic_intensity)) {
+		cerr << "ERROR: Arithmetic intensity must be finite and greater than zero." << endl;
+		exit(26);
+	}
+	if (threads_per_block <= 0 || num_blocks <= 0) {
+		cerr << "ERROR: Threads and blocks must be greater than zero." << endl;
+		exit(27);
+	}
+	if (target == "global" && working_set_mb == 0) {
+		cerr << "ERROR: Global mixed benchmark working set must be greater than zero." << endl;
+		exit(28);
+	}
+
+	string cuda_type;
+	int element_bytes = 0;
+	int lanes = 1;
+	if (precision == "sp") {
+		cuda_type = "float";
+		element_bytes = 4;
+	} else if (precision == "dp") {
+		cuda_type = "double";
+		element_bytes = 8;
+	} else if (precision == "hp") {
+		cuda_type = "half";
+		element_bytes = 2;
+	} else if (precision == "hp2") {
+		cuda_type = "half2";
+		element_bytes = 4;
+		lanes = 2;
+	} else if (precision == "bf16") {
+		cuda_type = "nv_bfloat16";
+		element_bytes = 2;
+	} else {
+		cerr << "ERROR: Mixed benchmark supports sp, dp, hp, hp2, and bf16." << endl;
+		exit(29);
+	}
+	if (target == "shared" && precision != "sp" && precision != "dp") {
+		cerr << "ERROR: Shared mixed benchmark currently supports sp and dp." << endl;
+		exit(30);
+	}
+
+	const int scalar_flops = operation == "fma" ? 2 : 1;
+	const int flops_per_element_op = scalar_flops * lanes;
+	long long operation_count = llround(arithmetic_intensity * 2.0 * element_bytes /
+									  flops_per_element_op);
+	operation_count = max<long long>(1, operation_count);
+	if (operation_count > 65536) {
+		cerr << "ERROR: Requested arithmetic intensity requires more than 65536 operations per element."
+			 << endl;
+		exit(31);
+	}
+	const double effective_ai = static_cast<double>(operation_count * flops_per_element_op) /
+		(2.0 * element_bytes);
+	if (working_set_mb > numeric_limits<uint64_t>::max() / (1024ULL * 1024ULL)) {
+		cerr << "ERROR: Working set is too large." << endl;
+		exit(32);
+	}
+	const uint64_t working_set_bytes = working_set_mb * 1024ULL * 1024ULL;
+
+	if (!filesystem::is_directory("GPU/bin") && !filesystem::create_directory("GPU/bin")) {
+		cerr << "ERROR: Wasn't able to create bin directory" << endl;
+		exit(33);
+	}
+	ifstream input("GPU/Test/nvidia/mixed/vector.cu");
+	ofstream output("GPU/bin/test.cu");
+	if (!input.is_open() || !output.is_open()) {
+		cerr << "ERROR: Could not open mixed benchmark template or generated output." << endl;
+		exit(34);
+	}
+
+	string text;
+	while (getline(input, text)) {
+		output << text << endl;
+		if (text == "// DEFINE NUM_REPS") {
+			output << "#define NUM_REPS " << Num_Reps << endl;
+		} else if (text == "// DEFINE KERNEL PARAMETERS") {
+			output << "#define THREADS_PER_BLOCK " << threads_per_block << endl;
+			output << "#define NUM_BLOCKS " << num_blocks << endl;
+		} else if (text == "// DEFINE PRECISION") {
+			output << "#define PRECISION " << cuda_type << endl;
+		} else if (text == "// DEFINE DEVICE") {
+			output << "#define DEVICE " << device << endl;
+		} else if (text == "// DEFINE MIXED PARAMETERS") {
+			const int memory_target = target == "global" ? 0 : (target == "L2" ? 1 : 2);
+			output << "#define MEMORY_TARGET " << memory_target << endl;
+			output << "#define OP_COUNT " << operation_count << endl;
+			output << "#define FLOPS_PER_ELEMENT_OP " << flops_per_element_op << endl;
+			output << setprecision(17) << "#define EFFECTIVE_AI " << effective_ai << endl;
+			output << "#define REQUESTED_WORKING_SET_BYTES " << working_set_bytes << "ULL" << endl;
+		} else if (text == "\t// DEFINE OPERATION") {
+			if (precision == "sp") {
+				if (operation == "fma")
+					output << "\treturn fmaf(value, 0.99999994f, 0.000000119f);" << endl;
+				else if (operation == "add")
+					output << "\treturn value + 0.000000119f;" << endl;
+				else
+					output << "\treturn value * 0.99999994f;" << endl;
+			} else if (precision == "dp") {
+				if (operation == "fma")
+					output << "\treturn fma(value, 0.99999999999999989, 2.2204460492503131e-16);" << endl;
+				else if (operation == "add")
+					output << "\treturn value + 2.2204460492503131e-16;" << endl;
+				else
+					output << "\treturn value * 0.99999999999999989;" << endl;
+			} else if (precision == "hp") {
+				if (operation == "fma")
+					output << "\treturn __hfma(value, __float2half(0.999f), __float2half(0.001f));" << endl;
+				else if (operation == "add")
+					output << "\treturn __hadd(value, __float2half(0.001f));" << endl;
+				else
+					output << "\treturn __hmul(value, __float2half(0.999f));" << endl;
+			} else if (precision == "hp2") {
+				if (operation == "fma")
+					output << "\treturn __hfma2(value, __float2half2_rn(0.999f), __float2half2_rn(0.001f));" << endl;
+				else if (operation == "add")
+					output << "\treturn __hadd2(value, __float2half2_rn(0.001f));" << endl;
+				else
+					output << "\treturn __hmul2(value, __float2half2_rn(0.999f));" << endl;
+			} else {
+				if (operation == "fma")
+					output << "\treturn __hfma(value, __float2bfloat16(0.9921875f), __float2bfloat16(0.0078125f));" << endl;
+				else if (operation == "add")
+					output << "\treturn __hadd(value, __float2bfloat16(0.0078125f));" << endl;
+				else
+					output << "\treturn __hmul(value, __float2bfloat16(0.9921875f));" << endl;
+			}
+		}
+	}
+	input.close();
+	output.close();
+
+	const string command = "make compute_capability=" + compute_capability +
+		" -f GPU/Test/nvidia/Makefile";
+	if (system(command.data()) != 0) {
+		cerr << "ERROR: It was not possible to generate the mixed benchmark." << endl;
+		exit(35);
 	}
 }

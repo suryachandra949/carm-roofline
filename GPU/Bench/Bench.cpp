@@ -2,6 +2,7 @@
 #include <stdlib.h>
 
 #include <cstdlib>
+#include <cstdint>
 #include <iostream>
 #include <string>
 
@@ -24,6 +25,8 @@ int main(int argc, char* argv[]) {
 									  {"threads", required_argument, 0, 's'},
 									  {"blocks", required_argument, 0, 'b'},
 									  {"device", required_argument, 0, 'd'},
+									  {"ai", required_argument, 0, 'r'},
+									  {"working-set-mb", required_argument, 0, 'w'},
 									  {0, 0, 0, 0}};
 
 	int o;
@@ -31,8 +34,10 @@ int main(int argc, char* argv[]) {
 	string test, target, precision, operation, arch, compute_capability;
 	int threads_per_block = 0, num_blocks = 0;
 	int DEVICE = 0;
+	double arithmetic_intensity = 0.0;
+	uint64_t working_set_mb = 0;
 
-	while ((o = getopt_long(argc, argv, "t:c:i:p:o:hs:b:d:", longopts, NULL)) != -1) switch (o) {
+	while ((o = getopt_long(argc, argv, "t:c:i:a:p:o:hs:b:d:r:w:", longopts, NULL)) != -1) switch (o) {
 			case 't':
 				test = optarg;
 				break;
@@ -59,6 +64,12 @@ int main(int argc, char* argv[]) {
 				break;
 			case 'd':
 				DEVICE = atoi(optarg);
+				break;
+			case 'r':
+				arithmetic_intensity = strtod(optarg, NULL);
+				break;
+			case 'w':
+				working_set_mb = strtoull(optarg, NULL, 10);
 				break;
 			case 'h':
 				// TODO: IMPLEMENT
@@ -103,7 +114,8 @@ int main(int argc, char* argv[]) {
 		create_benchmark_mem(DEVICE, arch, compute_capability, target, precision, threads_per_block,
 							 num_blocks);
 	} else if (test == "MIXED") {
-		// TODO
+		create_benchmark_mixed(DEVICE, arch, compute_capability, target, operation, precision,
+						   arithmetic_intensity, working_set_mb, threads_per_block, num_blocks);
 	} else {
 		cerr << "ERROR: Test not found. Please select a valid test." << endl;
 		return 2;
