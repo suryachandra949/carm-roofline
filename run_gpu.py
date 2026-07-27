@@ -565,7 +565,21 @@ def main():
 	parser.add_argument('--mixed_target', default='global', nargs='?', choices=['shared', 'L2', 'global'], help='Memory level used by the mixed benchmark (Default: global)')
 	parser.add_argument('--ai', default=32.0, nargs='?', type=float, help='Requested mixed-benchmark arithmetic intensity in FLOPs/byte (Default: 32)')
 	parser.add_argument('--working_set_mb', default=512, nargs='?', type=int, help='Total two-buffer global-memory working set in MiB (Default: 512)')
+  parser.add_argument('--iterations',default=200,type=int,help='Number of measured mixed benchmark iterations (Default: 200)')
 
+  parser.add_argument(
+      '--warmup_iterations',
+      default=25,
+      type=int,
+      help='Number of untimed warm-up iterations (Default: 25)'
+  )
+
+  parser.add_argument(
+      '--l2_fraction',
+      default=0.50,
+      type=float,
+      help='Fraction of detected L2 capacity used by the L2 benchmark (Default: 0.50)'
+  )
 	parser.add_argument('--threads', default=1024, nargs='?', type=int, help='Num of threads per block to execute in the benchmarks')
 	parser.add_argument('--blocks', default=32768, nargs='?', type=int, help='Number of thread blocks to execute in the benchmarks')
 
