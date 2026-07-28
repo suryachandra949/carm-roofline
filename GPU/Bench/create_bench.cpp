@@ -730,4 +730,145 @@ void create_benchmark_mem(int device, string arch, string compute_capability, st
 			exit(22);
 		}
 	}
+}// Append this file's contents to GPU/Bench/create_bench.cpp.
+// It uses the existing headers, namespace, Num_Reps constant, and Makefiles.
+
+static string mixed_precision_type(const string &arch, const string &precision) {
+	if (precision == "sp") return "float";
+	if (precision == "dp") return "double";
+	if (precision == "hp") return "half";
+	if (precision == "hp2") return "half2";
+	if (precision == "bf16") return arch == "nvidia" ? "nv_bfloat16" : "hip_bfloat16";
+	cerr << "ERROR: Mixed benchmark supports sp, dp, hp, hp2, and bf16." << endl;
+	exit(23);
+}
+
+static void emit_mixed_initialization(ofstream &output, const string &arch,
+									  const string &precision) {
+	string one, scale, bias;
+	if (arch == "nvidia" && precision == "hp") {
+		one = "__float2half(1.0f)";
+		scale = "__float2half(0.999f)";
+		bias = "__float2half(0.001f)";
+	} else if (arch == "nvidia" && precision == "hp2") {
+		one = "__float2half2_rn(1.0f)";
+		scale = "__float2half2_rn(0.999f)";
+		bias = "__float2half2_rn(0.001f)";
+	} else if (arch == "nvidia" && precision == "bf16") {
+		one = "__float2bfloat16(1.0f)";
+		scale = "__float2bfloat16(0.999f)";
+		bias = "__float2bfloat16(0.001f)";
+	} else {
+		one = "(PRECISION)1.0";
+		scale = "(PRECISION)0.999";
+		bias = "(PRECISION)0.001";
+	}
+
+	for (int i = 0; i < 8; ++i)
+		output << "\tPRECISION a" << i << " = " << one << ";\n";
+	output << "\tconst PRECISION fp_scale = " << scale << ";\n";
+	output << "\tconst PRECISION fp_bias = " << bias << ";\n";
+}
+
+static void emit_mixed_fp_op(ofstream &output, const string &arch, const string &precision,
+							 const string &operation, int operation_index) {
+	const int r = operation_index % 8;
+	const string a = "a" + to_string(r);
+	output << "\t\t\t";
+
+	if (arch == "nvidia" && (precision == "hp" || precision == "bf16")) {
+		if (operation == "fma")
+			output << a << " = __hfma(" << a << ", fp_scale, fp_bias);";
+		else if (operation == "add")
+			output << a << " = __hadd(" << a << ", fp_bias);";
+		else if (operation == "mul")
+			output << a << " = __hmul(" << a << ", fp_scale);";
+	} else if (arch == "nvidia" && precision == "hp2") {
+		if (operation == "fma")
+			output << a << " = __hfma2(" << a << ", fp_scale, fp_bias);";
+		else if (operation == "add")
+			output << a << " = __hadd2(" << a << ", fp_bias);";
+		else if (operation == "mul")
+			output << a << " = __hmul2(" << a << ", fp_scale);";
+	} else {
+		if (operation == "fma")
+			output << a << " = " << a << " * fp_scale + fp_bias;";
+		else if (operation == "add")
+			output << a << " = " << a << " + fp_bias;";
+		else if (operation == "mul")
+			output << a << " = " << a << " * fp_scale;";
+	}
+	output << endl;
+}
+
+void create_benchmark_mixed(int device, string arch, string compute_capability, string target,
+							string operation, string precision, int num_fp,
+							int threads_per_block, int num_blocks) {
+	if (target != "shared" && target != "L2" && target != "global") {
+		cerr << "ERROR: Mixed target must be shared, L2, or global." << endl;
+		exit(23);
+	}
+	if (operation != "fma" && operation != "add" && operation != "mul") {
+		cerr << "ERROR: Mixed operation must be fma, add, or mul." << endl;
+		exit(23);
+	}
+	if (num_fp < 1) {
+		cerr << "ERROR: --num-fp must be at least 1." << endl;
+		exit(23);
+	}
+	if (!filesystem::is_directory("GPU/bin") && !filesystem::create_directory("GPU/bin")) {
+		cerr << "ERROR: Wasn't able to create bin directory" << endl;
+		exit(23);
+	}
+
+	const string extension = arch == "nvidia" ? ".cu" : ".hip";
+	const string source_name = target == "shared" ? "shared" : "stream";
+	const string input_path = "GPU/Test/" + arch + "/mixed/" + source_name + extension;
+	const string output_path = "GPU/bin/test" + extension;
+
+	ifstream input(input_path);
+	ofstream output(output_path);
+	if (!input.is_open() || !output.is_open()) {
+		cerr << "ERROR: Could not open mixed benchmark template or output file." << endl;
+		exit(23);
+	}
+
+	const int half_point = (num_fp + 1) / 2;
+	string text;
+	while (getline(input, text)) {
+		output << text << endl;
+		if (text == "// DEFINE NUM_REPS") {
+			output << "#define NUM_REPS " << Num_Reps << endl;
+		} else if (text == "// DEFINE KERNEL PARAMETERS") {
+			output << "#define THREADS_PER_BLOCK " << threads_per_block << endl;
+			output << "#define NUM_BLOCKS " << num_blocks << endl;
+		} else if (text == "// DEFINE PRECISION") {
+			output << "#define PRECISION " << mixed_precision_type(arch, precision) << endl;
+		} else if (text == "// DEFINE DEVICE") {
+			output << "#define DEVICE " << device << endl;
+		} else if (text == "// DEFINE TARGET") {
+			output << "#define TARGET_L2 " << (target == "L2" ? 1 : 0) << endl;
+		} else if (text == "// DEFINE TEST") {
+			output << "#define NUM_FP " << num_fp << endl;
+			output << "#define FLOPS_PER_INST " << (operation == "fma" ? 2 : 1) << endl;
+			output << "#define PACKED_LANES " << (precision == "hp2" ? 2 : 1) << endl;
+		} else if (text == "\t// DEFINE INITIALIZATION") {
+			emit_mixed_initialization(output, arch, precision);
+		} else if (text == "\t\t\t// DEFINE FP FIRST") {
+			for (int i = 0; i < half_point; ++i)
+				emit_mixed_fp_op(output, arch, precision, operation, i);
+		} else if (text == "\t\t\t// DEFINE FP SECOND") {
+			for (int i = half_point; i < num_fp; ++i)
+				emit_mixed_fp_op(output, arch, precision, operation, i);
+		}
+	}
+	input.close();
+	output.close();
+
+	const string makefile = arch == "nvidia" ? "GPU/Test/nvidia/Makefile" : "GPU/Test/amd/Makefile";
+	const string command = "make compute_capability=" + compute_capability + " -f " + makefile;
+	if (system(command.data()) != 0) {
+		cerr << "ERROR: It was not possible to generate the mixed benchmark." << endl;
+		exit(23);
+	}
 }

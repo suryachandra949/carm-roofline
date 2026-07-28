@@ -408,7 +408,133 @@ def run_roofline(verbose, name, out, set_freq, freq_sm, freq_mem, arch, target_v
 		update_csv(name, "Roofline", outputs, date, "tensor", precision, "mma", threads, blocks, out)
 		print("--------------------------------------------------")
 
+MIXED_PRECISION_BYTES = {
+    "hp": 2,
+    "hp2": 4,
+    "bf16": 2,
+    "sp": 4,
+    "dp": 8,
+}
 
+
+def mixed_num_fp(requested_ai, precision, operation):
+    if precision not in MIXED_PRECISION_BYTES:
+        raise ValueError(f"Unsupported mixed precision: {precision}")
+    fp_per_instruction = 2 if operation == "fma" else 1
+    packed_lanes = 2 if precision == "hp2" else 1
+    bytes_per_item = 2 * MIXED_PRECISION_BYTES[precision]  # one load + one store
+    num_fp = max(1, round(requested_ai * bytes_per_item /
+                          (fp_per_instruction * packed_lanes)))
+    actual_ai = (num_fp * fp_per_instruction * packed_lanes) / bytes_per_item
+    return num_fp, actual_ai
+
+
+def parse_mixed_output(text):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("Mixed benchmark produced no output")
+
+    # The benchmark result should be the final non-empty line.
+    result_line = lines[-1]
+
+    fields = {}
+    for item in result_line.split(','):
+        if '=' not in item:
+            continue
+
+        key, value = item.split('=', 1)
+        fields[key.strip()] = float(value.strip())
+
+    required = {"AI", "GFLOPS", "GBPS", "FLOPS", "BYTES"}
+    missing = required.difference(fields)
+
+    if missing:
+        raise ValueError(
+            f"Missing mixed output fields {sorted(missing)}. "
+            f"Received: {result_line!r}"
+        )
+
+    return fields
+
+
+def update_mixed_csv(name, row, out_path):
+    directory = os.path.join(out_path, "Mixed")
+    os.makedirs(directory, exist_ok=True)
+    csv_path = os.path.join(directory, f"{name}_Mixed.csv")
+    headers = [
+        "Date", "Architecture", "Target", "Precision", "Operation",
+        "ThreadsPerBlock", "Blocks", "NumFP", "Loads", "Stores",
+        "RequestedAI", "ActualAI", "GFLOPS", "GBPS", "TotalFLOPs", "TotalBytes"
+    ]
+    exists = os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=headers)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def run_mixed(verbose, name, out, set_freq, freq_sm, freq_mem, arch,
+              target_vector, vector_op, threads, blocks, mixed_targets, ai_points):
+    compute_capability, target_vector, _ = check_hardware(
+        verbose, set_freq, freq_sm, freq_mem, arch, target_vector, ["none"])
+
+    target_vector = [p for p in target_vector if p in MIXED_PRECISION_BYTES]
+    os.system("cd GPU && make -s clean && make -s")
+
+    for precision in target_vector:
+        for target in mixed_targets:
+            for requested_ai in ai_points:
+                num_fp, expected_ai = mixed_num_fp(requested_ai, precision, vector_op)
+                generator = subprocess.run([
+                    "./GPU/Bench/Bench",
+                    "--test", "MIXED",
+                    "--target", target,
+                    "--arch", arch,
+                    "--operation", vector_op,
+                    "--precision", precision,
+                    "--num-fp", str(num_fp),
+                    "--compute", str(compute_capability),
+                    "--threads", str(threads),
+                    "--blocks", str(blocks),
+                    "--device", str(DEVICE),
+                ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if generator.returncode != 0:
+                    raise RuntimeError(generator.stderr.decode("utf-8").rstrip())
+
+                result = subprocess.run(["./GPU/bin/test"],
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE)
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.decode("utf-8").rstrip())
+
+                output = result.stdout.decode("utf-8").strip()
+                values = parse_mixed_output(output)
+                if verbose > 0:
+                    print(f"Mixed({target}, {precision}, {vector_op}, "
+                          f"requested AI={requested_ai}, actual AI={values['AI']}): "
+                          f"{values['GFLOPS']} GFLOP/s, {values['GBPS']} GB/s")
+
+                update_mixed_csv(name, {
+                    "Date": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "Architecture": arch,
+                    "Target": target,
+                    "Precision": precision,
+                    "Operation": vector_op,
+                    "ThreadsPerBlock": threads,
+                    "Blocks": blocks,
+                    "NumFP": num_fp,
+                    "Loads": 1,
+                    "Stores": 1,
+                    "RequestedAI": requested_ai,
+                    "ActualAI": values["AI"],
+                    "GFLOPS": values["GFLOPS"],
+                    "GBPS": values["GBPS"],
+                    "TotalFLOPs": values["FLOPS"],
+                    "TotalBytes": values["BYTES"],
+                }, out)
+
+                
 def shutdown(set_freq):
 	if set_freq:
 		result = subprocess.run(['nvidia-smi', '-i', str(DEVICE), '-pm', '0'], stdout=subprocess.PIPE)
@@ -419,7 +545,7 @@ def shutdown(set_freq):
 def main():
 	# Parse arguments
 	parser = argparse.ArgumentParser(description='Script to run GPU micro-benchmarks to construct the Cache-Aware Roofline Model for GPUs')
-	parser.add_argument('--test', default='roofline', nargs= '?', choices=['FP', 'TC', 'roofline', 'MEM'], help='Type of test.Type of the test. Roofline test measures the bandwidth of the different memory levels and FP Performance, MEM test measures the bandwidth of various memory sizes, mixed test measures bandwidth and FP performance for a combination of memory acceses (to L1, L2, L3, or DRAM) and FP operations (Default: roofline) ')
+	parser.add_argument('--test', default='roofline', nargs= '?', choices=['FP', 'TC', 'roofline', 'MEM', 'mixed'], help='Type of test.Type of the test. Mixed measures FP performance and bandwidth simultaneously at selected arithmetic intensities. Roofline test measures the bandwidth of the different memory levels and FP Performance, MEM test measures the bandwidth of various memory sizes, mixed test measures bandwidth and FP performance for a combination of memory acceses (to L1, L2, L3, or DRAM) and FP operations (Default: roofline) ')
 	parser.add_argument('--name', default='unnamed', nargs= '?', help='Name of the GPU to be tested (if not using config file)')
 	parser.add_argument('config', nargs='?', help='Path to the configuration file')
 	parser.add_argument('-v', '--verbose', default=1, nargs='?', type=int, choices=[0, 1, 2, 3], help='Level of terminal output (0 -> No Output 1 -> Only Errors and Test Details, 2 -> Intermediate Test Results, 3 -> Configuration Values Selected/Detected)')
@@ -436,6 +562,21 @@ def main():
 	parser.add_argument('--threads', default=1024, nargs='?', type=int, help='Num of threads per block to execute in the benchmarks')
 	parser.add_argument('--blocks', default=32768, nargs='?', type=int, help='Number of thread blocks to execute in the benchmarks')
 
+	parser.add_argument(
+		'--mixed_target',
+		nargs='+',
+		default=['shared', 'L2', 'global'],
+		choices=['shared', 'L2', 'global'],
+		help='Memory levels to test with mixed FP and memory operations.',
+	)
+
+	parser.add_argument(
+		'--ai',
+		nargs='+',
+		type=float,
+		default=[0.25, 0.5, 1, 2, 4, 8, 16, 32],
+		help='Requested arithmetic-intensity points in FLOP/byte.',
+	)
 	args = parser.parse_args()
 
 	name = ''
@@ -465,9 +606,39 @@ def main():
 			print('AMD GPU not detected. This tool requires the amd-smi CLI.')
 			sys.exit(1)
 
-	run_roofline(args.verbose, args.name, args.output, args.set_freq, args.freq_sm, args.freq_mem, arch, args.vector, args.tensor, args.vector_op, args.threads, args.blocks)
+	if args.test == 'mixed':
+		run_mixed(
+			args.verbose,
+			name,
+			args.output,
+			args.set_freq,
+			args.freq_sm,
+			args.freq_mem,
+			arch,
+			args.vector,
+			args.vector_op,
+			args.threads,
+			args.blocks,
+			args.mixed_target,
+			args.ai,
+		)
+	else:
+		run_roofline(
+			args.verbose,
+			name,
+			args.output,
+			args.set_freq,
+			args.freq_sm,
+			args.freq_mem,
+			arch,
+			args.vector,
+			args.tensor,
+			args.vector_op,
+			args.threads,
+			args.blocks,
+		)
 
 	shutdown(args.set_freq)
 
-if __name__ == '__main__':
-	main()
+	if __name__ == '__main__':
+		main()

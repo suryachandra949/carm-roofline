@@ -11,3 +11,7 @@ void create_benchmark_matrix(int device, string compute_capability, string preci
 
 void create_benchmark_mem(int device, string arch, string compute_capability, string target,
 						  string precision, int threads_per_block, int num_blocks);
+
+void create_benchmark_mixed(int device, string arch, string compute_capability, string target,
+                            string operation, string precision, int num_fp,
+                            int threads_per_block, int num_blocks);

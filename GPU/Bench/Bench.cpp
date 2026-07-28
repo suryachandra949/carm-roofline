@@ -24,15 +24,16 @@ int main(int argc, char* argv[]) {
 									  {"threads", required_argument, 0, 's'},
 									  {"blocks", required_argument, 0, 'b'},
 									  {"device", required_argument, 0, 'd'},
+									  {"num-fp", required_argument, 0, 'f'},
 									  {0, 0, 0, 0}};
 
 	int o;
 
 	string test, target, precision, operation, arch, compute_capability;
-	int threads_per_block = 0, num_blocks = 0;
+	int threads_per_block = 0, num_blocks = 0, num_fp = 0;
 	int DEVICE = 0;
 
-	while ((o = getopt_long(argc, argv, "t:c:i:p:o:hs:b:d:", longopts, NULL)) != -1) switch (o) {
+	while ((o = getopt_long(argc, argv, "t:c:i:a:p:o:hs:b:d:f:", longopts, NULL)) != -1) switch (o) {
 			case 't':
 				test = optarg;
 				break;
@@ -59,6 +60,9 @@ int main(int argc, char* argv[]) {
 				break;
 			case 'd':
 				DEVICE = atoi(optarg);
+				break;
+			case 'f':
+				num_fp = atoi(optarg);
 				break;
 			case 'h':
 				// TODO: IMPLEMENT
@@ -103,7 +107,8 @@ int main(int argc, char* argv[]) {
 		create_benchmark_mem(DEVICE, arch, compute_capability, target, precision, threads_per_block,
 							 num_blocks);
 	} else if (test == "MIXED") {
-		// TODO
+		create_benchmark_mixed(DEVICE, arch, compute_capability, target, operation, precision,
+							   num_fp, threads_per_block, num_blocks);
 	} else {
 		cerr << "ERROR: Test not found. Please select a valid test." << endl;
 		return 2;
