@@ -640,5 +640,5 @@ def main():
 
 	shutdown(args.set_freq)
 
-	if __name__ == '__main__':
-		main()
+if __name__ == '__main__':
+	main()
