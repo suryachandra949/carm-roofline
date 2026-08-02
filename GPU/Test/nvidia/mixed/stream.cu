@@ -543,3 +543,4 @@ int main() {
 
 	CUDA_CHECK(cudaFree(source));
 	CUDA_CHECK(cudaFree(destination));
+}
